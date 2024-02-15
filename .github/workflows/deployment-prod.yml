@@ -33,22 +33,82 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: image tag
+    - name: Read Current Version from ECR repo images
+      id: read-version
       run: |
-        git fetch origin
-        git branch
-        git describe --exact-match --tags $(git log -n1 --pretty='%h' origin/main)
-        IMAGE_TAG=$(git describe --exact-match --tags $(git log -n1 --pretty='%h' origin/main))
-        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-        echo $IMAGE_TAG
+          # Get the latest image tag from the ECR repository
+          VERSION=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --region $AWS_REGION --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]' --output text)
+          echo "::set-output name=version::$VERSION"
+      env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
       
+    - name: Determine semantic version
+      id: determine-version
+      run: |
+          # Extract commit message from the latest commit
+          COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+
+          # Determine the version type based on the commit message
+          if echo "$COMMIT_MESSAGE" | grep -q 'BREAKING CHANGE'; then
+            echo "::set-output name=version::major"
+          elif echo "$COMMIT_MESSAGE" | grep -q 'feat'; then
+            echo "::set-output name=version::minor"
+          else
+            echo "::set-output name=version::patch"
+          fi
+
+    - name: Determine version update
+      id: determine-update
+      run: |
+          VERSION=$(echo ${{ steps.determine-version.outputs.version }})
+          if [ "$VERSION" = "major" ]; then
+            echo "::set-output name=update::major"
+          elif [ "$VERSION" = "minor" ]; then
+            echo "::set-output name=update::minor"
+          else
+            echo "::set-output name=update::patch"
+          fi
+
+    - name: Update Version
+      id: update-version
+      run: |
+          CURRENT_VERSION="v1.0.2"    #$(echo ${{ steps.read-version.outputs.version }})
+          VERSION_TYPE=$(echo ${{ steps.determine-version.outputs.version }})
+
+          # Parse the version numbers
+          IFS='.' read -r -a VERSION_ARRAY <<< "$CURRENT_VERSION"
+          MAJOR=${VERSION_ARRAY[0]}
+          MINOR=${VERSION_ARRAY[1]}
+          PATCH=${VERSION_ARRAY[2]}
+
+          # Update version numbers based on the release type
+          if [ "$VERSION_TYPE" = "major" ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [ "$VERSION_TYPE" = "minor" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          # Generate the new version
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "$NEW_VERSION" > VERSION
+          echo "::set-output name=new_version::$NEW_VERSION"
+
     - name: Build, tag, and push image to Amazon ECR
       env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
       run: |
-        echo $ECR_REGISTRY
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Application/Dockerfile .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          VERSION=$(echo ${{ steps.update-version.outputs.new_version }})
+          UPDATE=$(echo ${{ steps.determine-update.outputs.update }})
+
+          IMAGE_TAG="${VERSION}"
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Application/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
     
     - name: Install Pritunl VPN
       run: |
@@ -64,7 +124,7 @@ jobs:
 
     - name: Connect VPN
       run: |
-          pritunl-client add ./user-11.tar
+          pritunl-client add ./user-13.tar
           pritunl-client start "$(pritunl-client list | awk 'NR>2 {print $2}' | tr -d '[:space:]')" --password ${{ secrets.PRITUNL_PIN }} 
         
     - name: Update kube config
